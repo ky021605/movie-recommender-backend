@@ -91,7 +91,7 @@ SOCIAL_DB = {}
 # --- NEW: ADMIN BLOCKLIST MEMORY ---
 BANNED_MOVIES = set()
 # Put the exact ID numbers of the bad actors here!
-BANNED_ACTORS = {3194176}
+BANNED_ACTORS = {2349944, 1706911, 2472212, 3988601, 5392874, 3424435, 4103293, 1781425, 5756283, 5531949, 3164807, 2484644, 1622390, 2710789}
 
 try:
     with open("data/banned.json", "r") as f:
@@ -180,7 +180,6 @@ def handle_interaction():
     return jsonify({"success": True, "data": SOCIAL_DB[tmdb_id]})
 
 
-# --- NEW: ADMIN MODERATION ENDPOINT ---
 # --- NEW: ADMIN MODERATION ENDPOINT WITH CHAIN BAN ---
 @app.route('/api/admin/ban', methods=['POST'])
 def admin_ban():
