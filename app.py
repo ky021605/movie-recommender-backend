@@ -473,49 +473,51 @@ def get_movie_of_the_day():
 
 @app.route('/api/trending-actors', methods=['GET'])
 def get_trending_actors():
+    """Fetches the top 12 safe actors by scanning pages in order."""
     try:
         TMDB_TOKEN = os.getenv("TMDB_ACCESS_TOKEN")
-        
-        
-        # Always fetch Page 1 to keep the exact same set of top actors
-        url = "https://api.themoviedb.org/3/trending/person/week?language=en-US&page=1"
         headers = {"Authorization": f"Bearer {TMDB_TOKEN}", "accept": "application/json"}
         
-        res = requests.get(url, headers=headers)
-        if res.status_code == 200:
-            actors = res.json().get('results', [])
+        bad_words = ["erotic", "porn", "softcore", "sex ", "lust", "seduce", "sensual", "desire", "vivamax", "nude", "nudity", "steamy", "affair", "scandal"]
+        valid_actors = []
+        
+        # Scan page 1, 2, and 3 in order until we have 12 safe actors
+        for page in range(1, 4):
+            url = f"https://api.themoviedb.org/3/trending/person/week?language=en-US&page={page}"
+            res = requests.get(url, headers=headers)
             
-            bad_words = ["erotic", "porn", "softcore", "sex ", "lust", "seduce", "sensual", "desire", "vivamax", "nude", "nudity", "steamy", "affair", "scandal"]
-            valid_actors = []
-            
-            for a in actors:
-                # 1. Check Admin Blocklist
-                if a["id"] in BANNED_ACTORS:
-                    continue
-                    
-                # 2. Check TMDB Adult Flag
-                if not a.get("profile_path") or a.get("adult", False):
-                    continue
-                    
-                is_safe = True
+            if res.status_code == 200:
+                actors = res.json().get('results', [])
                 
-                # 3. Check for inappropriate words in their known movies
-                for work in a.get("known_for", []):
-                    text = str(work.get("overview", "")) + " " + str(work.get("title", "")) + " " + str(work.get("name", ""))
-                    if any(bad in text.lower() for bad in bad_words):
-                        is_safe = False
-                        break 
+                for a in actors:
+                    # 1. Skip banned actors
+                    if a["id"] in BANNED_ACTORS:
+                        continue
                         
-                # 4. If they pass the text check, accept them!
-                if is_safe:
-                    valid_actors.append({"id": a["id"], "name": a["name"], "profile_path": a["profile_path"]})
-
-            # Slice the exact top 12 actors instead of randomly shuffling them
-            selected_actors = valid_actors[:12]
+                    # 2. Skip if no picture or marked adult
+                    if not a.get("profile_path") or a.get("adult", False):
+                        continue
+                        
+                    # 3. Check movie plots for bad words
+                    is_safe = True
+                    for work in a.get("known_for", []):
+                        text = str(work.get("overview", "")) + " " + str(work.get("title", "")) + " " + str(work.get("name", ""))
+                        if any(bad in text.lower() for bad in bad_words):
+                            is_safe = False
+                            break 
+                            
+                    if is_safe:
+                        valid_actors.append({"id": a["id"], "name": a["name"], "profile_path": a["profile_path"]})
+                        
+                    # Stop as soon as we collect 12 safe actors
+                    if len(valid_actors) == 12:
+                        break
+                        
+            if len(valid_actors) == 12:
+                break
                 
-            return jsonify({"success": True, "actors": selected_actors})
-            
-        return jsonify({"success": False, "error": "TMDB API connection failed"}), 500
+        return jsonify({"success": True, "actors": valid_actors})
+        
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
