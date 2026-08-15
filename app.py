@@ -476,9 +476,9 @@ def get_trending_actors():
     try:
         TMDB_TOKEN = os.getenv("TMDB_ACCESS_TOKEN")
         
-        # Stick to the top 2 pages to ensure high-quality actors
-        random_page = random.randint(1, 2)
-        url = f"https://api.themoviedb.org/3/trending/person/week?language=en-US&page={random_page}"
+        
+        # Always fetch Page 1 to keep the exact same set of top actors
+        url = "https://api.themoviedb.org/3/trending/person/week?language=en-US&page=1"
         headers = {"Authorization": f"Bearer {TMDB_TOKEN}", "accept": "application/json"}
         
         res = requests.get(url, headers=headers)
@@ -510,10 +510,8 @@ def get_trending_actors():
                 if is_safe:
                     valid_actors.append({"id": a["id"], "name": a["name"], "profile_path": a["profile_path"]})
 
-            if len(valid_actors) > 12:
-                selected_actors = random.sample(valid_actors, 12)
-            else:
-                selected_actors = valid_actors
+            # Slice the exact top 12 actors instead of randomly shuffling them
+            selected_actors = valid_actors[:12]
                 
             return jsonify({"success": True, "actors": selected_actors})
             
