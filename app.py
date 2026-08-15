@@ -477,7 +477,8 @@ def get_trending_actors():
     try:
         TMDB_TOKEN = os.getenv("TMDB_ACCESS_TOKEN")
         
-        random_page = random.randint(1, 3)
+        # Stick to the top 2 pages to ensure high-quality actors
+        random_page = random.randint(1, 2)
         url = f"https://api.themoviedb.org/3/trending/person/week?language=en-US&page={random_page}"
         headers = {"Authorization": f"Bearer {TMDB_TOKEN}", "accept": "application/json"}
         
@@ -489,26 +490,25 @@ def get_trending_actors():
             valid_actors = []
             
             for a in actors:
-                # FYP SAFETY: Check the Admin Blocklist
+                # 1. Check Admin Blocklist
                 if a["id"] in BANNED_ACTORS:
                     continue
                     
+                # 2. Check TMDB Adult Flag
                 if not a.get("profile_path") or a.get("adult", False):
                     continue
                     
                 is_safe = True
-                mainstream_score = 0 
                 
+                # 3. Check for inappropriate words in their known movies
                 for work in a.get("known_for", []):
                     text = str(work.get("overview", "")) + " " + str(work.get("title", "")) + " " + str(work.get("name", ""))
                     if any(bad in text.lower() for bad in bad_words):
                         is_safe = False
                         break 
                         
-                    if work.get("vote_count", 0) > 150:
-                        mainstream_score += 1
-                        
-                if is_safe and mainstream_score > 0:
+                # 4. If they pass the text check, accept them!
+                if is_safe:
                     valid_actors.append({"id": a["id"], "name": a["name"], "profile_path": a["profile_path"]})
 
             if len(valid_actors) > 12:
