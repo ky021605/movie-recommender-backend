@@ -2,6 +2,7 @@ import os
 import pickle
 import pandas as pd
 import numpy as np
+import json
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import random 
@@ -34,13 +35,21 @@ except FileNotFoundError:
 
 # 2. Load the TMDB Global Data & VADER NLP Scores safely
 try:
-    df_movies = pd.read_csv("data/tmdb_movies_production.csv").fillna("")
+    raw_df = pd.read_csv("data/tmdb_movies_production.csv").fillna("")
     
-    # Safe dictionaries for fast API lookups
+    # --- FYP STRICT SAFETY FILTER ---
+    if 'adult' in raw_df.columns:
+        raw_df = raw_df[(raw_df['adult'] == False) | (raw_df['adult'] == 'False') | (raw_df['adult'] == '0')]
+        
+    if 'genres' in raw_df.columns:
+        banned_words = "Erotic|Adult|Porn|Softcore"
+        raw_df = raw_df[~raw_df['genres'].str.contains(banned_words, case=False, na=False)]
+        
+    df_movies = raw_df
+    # --------------------------------
+    
     title_map = dict(zip(df_movies['movie_id'], df_movies['title']))
     poster_map = dict(zip(df_movies['movie_id'], df_movies['poster_path']))
-    
-    # AI & Metadata maps (Using safe .get fallbacks in case columns are missing)
     mood_map = dict(zip(df_movies['movie_id'], df_movies['vader_sentiment'])) if 'vader_sentiment' in df_movies.columns else {}
     overview_map = dict(zip(df_movies['movie_id'], df_movies['overview'])) if 'overview' in df_movies.columns else {}
     genre_map = dict(zip(df_movies['movie_id'], df_movies['genres'])) if 'genres' in df_movies.columns else {}
@@ -56,7 +65,6 @@ except FileNotFoundError:
 # PHASE 2: DATABASES
 # ==========================================
 
-# User authentication database
 USER_DATABASE = {
     "admin": {
         "password": "password123", 
@@ -65,7 +73,7 @@ USER_DATABASE = {
         "display_name": "Admin Boss",
         "birthday": "2000-01-01",
         "bio": "I love movies with explosions.",
-        "needs_onboarding": False # Admin already has data
+        "needs_onboarding": False 
     },
     "testuser1": {
         "password": "abc", 
@@ -74,14 +82,25 @@ USER_DATABASE = {
         "display_name": "Test User",
         "birthday": "",
         "bio": "",
-        "needs_onboarding": True # This user will trigger the new screen!
+        "needs_onboarding": True 
     }
 }
 
-# Live interactive memory bank
-# Format: { tmdb_id: {"likes": int, "dislikes": int, "comments": [ {username, text} ] } }
 SOCIAL_DB = {}
 
+# --- NEW: ADMIN BLOCKLIST MEMORY ---
+BANNED_MOVIES = set()
+# Put the exact ID numbers of the bad actors here!
+BANNED_ACTORS = {3194176}
+
+try:
+    with open("data/banned.json", "r") as f:
+        b_data = json.load(f)
+        BANNED_MOVIES = set(b_data.get("movies", []))
+        BANNED_ACTORS = set(b_data.get("actors", []))
+except FileNotFoundError:
+    pass
+# -----------------------------------
 
 # ==========================================
 # PHASE 3: API ROUTES
@@ -89,7 +108,6 @@ SOCIAL_DB = {}
 
 @app.route('/api/login', methods=['POST'])
 def login():
-    """Authenticates a user and connects them to their AI profile."""
     data = request.json
     username = data.get('username')
     password = data.get('password')
@@ -106,7 +124,6 @@ def login():
 
 @app.route('/api/register', methods=['POST'])
 def register():
-    """Creates a new user and routes them immediately into the Onboarding Matrix."""
     data = request.json
     username = data.get('username')
     password = data.get('password')
@@ -117,10 +134,8 @@ def register():
     if username in USER_DATABASE:
         return jsonify({"success": False, "error": "Username already exists. Please login."}), 400
         
-    # Generate a new unique Matrix ID based on the highest existing ID
     new_matrix_id = max([u['matrix_id'] for u in USER_DATABASE.values()]) + 1 if USER_DATABASE else 100
     
-    # Save the brand new user to our system
     USER_DATABASE[username] = {
         "password": password,
         "matrix_id": new_matrix_id,
@@ -128,10 +143,9 @@ def register():
         "display_name": username,
         "birthday": "",
         "bio": "",
-        "needs_onboarding": True # Forces them to calibrate their AI matrix
+        "needs_onboarding": True 
     }
     
-    # Auto-login the user immediately after registration
     return jsonify({
         "success": True, 
         "matrix_id": new_matrix_id,
@@ -141,28 +155,20 @@ def register():
 
 @app.route('/api/interact', methods=['POST'])
 def handle_interaction():
-    """Saves a like, dislike, or a comment to the local server memory AND the ML Pipeline."""
     data = request.json
     tmdb_id = str(data.get('tmdb_id'))
     action = data.get('action') 
-    username = data.get('username', 'Anonymous') # Capture who is clicking
+    username = data.get('username', 'Anonymous') 
     
-    # Initialize the movie if it has no interactions yet
     if tmdb_id not in SOCIAL_DB:
         SOCIAL_DB[tmdb_id] = {"likes": 0, "dislikes": 0, "comments": []}
         
     if action == 'like':
         SOCIAL_DB[tmdb_id]['likes'] += 1
-        
-        # --- NEW: EXPORT REAL CLICKS FOR LIGHTFM ---
-        # Get the user's matrix ID (default to 42 for the admin)
         matrix_id = USER_DATABASE.get(username, {}).get("matrix_id", 42)
         os.makedirs("data", exist_ok=True)
-        
-        # Append the interaction to a CSV file for the training script to read
         with open("data/real_likes.csv", "a") as f:
             f.write(f"{matrix_id},{tmdb_id},1.0\n")
-        # -------------------------------------------
             
     elif action == 'dislike':
         SOCIAL_DB[tmdb_id]['dislikes'] += 1 
@@ -174,74 +180,101 @@ def handle_interaction():
     return jsonify({"success": True, "data": SOCIAL_DB[tmdb_id]})
 
 
+# --- NEW: ADMIN MODERATION ENDPOINT ---
+# --- NEW: ADMIN MODERATION ENDPOINT WITH CHAIN BAN ---
+@app.route('/api/admin/ban', methods=['POST'])
+def admin_ban():
+    """Human-in-the-Loop endpoint to permanently erase dangerous content."""
+    data = request.json
+    
+    if data.get('username') != 'admin':
+        return jsonify({"success": False, "error": "Unauthorized"}), 403
+        
+    item_type = data.get('type')
+    item_id = int(data.get('id'))
+    
+    if item_type == 'movie':
+        BANNED_MOVIES.add(item_id)
+        print(f"🛡️ ADMIN BAN: Movie {item_id} has been erased.")
+        
+    elif item_type == 'actor':
+        BANNED_ACTORS.add(item_id)
+        print(f"🛡️ ADMIN BAN: Actor {item_id} has been erased.")
+        
+        # --- NEW CHAIN BAN LOGIC ---
+        # Instantly ask TMDB for every movie this actor has made and ban them too
+        try:
+            TMDB_TOKEN = os.getenv("TMDB_ACCESS_TOKEN")
+            headers = {"Authorization": f"Bearer {TMDB_TOKEN}", "accept": "application/json"}
+            url = f"https://api.themoviedb.org/3/person/{item_id}/movie_credits?language=en-US"
+            
+            res = requests.get(url, headers=headers)
+            if res.status_code == 200:
+                # Add all their movies to the blocklist
+                for movie in res.json().get('cast', []):
+                    BANNED_MOVIES.add(movie['id'])
+                print(f"🛡️ CHAIN BAN: Erased all movies starring Actor {item_id}.")
+        except Exception as e:
+            print(f"Failed to run chain ban: {e}")
+        # ---------------------------
+        
+    os.makedirs("data", exist_ok=True)
+    with open("data/banned.json", "w") as f:
+        json.dump({"movies": list(BANNED_MOVIES), "actors": list(BANNED_ACTORS)}, f)
+        
+    return jsonify({"success": True})
+
+
+
 sia = SentimentIntensityAnalyzer()
 
 @app.route('/api/recommend', methods=['GET'])
 def get_live_recommendations():
-    """Generates mathematically personalized recommendations using the LightFM Matrix model, 
-    with explicit genre boosting and a live TMDB API fallback.
-    """
     try:
-        # 1. Capture the logged-in user's Matrix ID dynamically
         user_id = request.args.get('user_id', '42')
         top_n = int(request.args.get('top_n', 6))
-        
         recommendations = []
         used_lightfm = False
         
-        # 2. MACHINE LEARNING ENGINE: Compute matrix predictions if model & dataset are loaded
         if model is not None and not df_movies.empty:
             try:
                 user_matrix_id = int(user_id)
                 num_items = len(df_movies)
                 
-                # --- NEW: EXTRACT USER'S PROFILE PREFERENCES ---
-                # Search the database to find the genres this specific user added to their profile
                 preferred_genres = []
                 for uname, udata in USER_DATABASE.items():
                     if udata.get("matrix_id") == user_matrix_id:
                         preferred_genres = udata.get("preferred_genres", [])
                         break
-                # -----------------------------------------------
 
-                # Run LightFM mathematical matrix factorization across all items for this user
                 scores = model.predict(user_matrix_id, np.arange(num_items))
                 
-                # --- NEW: EXPLICIT GENRE BOOSTING (POST-PROCESSING) ---
-                # If the user has profile genres, artificially boost those movies to the top
                 if preferred_genres:
                     for i in range(num_items):
                         m_id = df_movies.iloc[i]['movie_id']
                         movie_genres = genre_map.get(m_id, "")
-                        
-                        # If any preferred genre is inside the movie's genre string, boost the AI score!
                         if any(pref.lower() in str(movie_genres).lower() for pref in preferred_genres):
-                            scores[i] += 5.0  # Massive weight multiplier to guarantee priority
-                # ------------------------------------------------------
+                            scores[i] += 5.0  
                 
-                # --- EXPLORATION VS EXPLOITATION ---
-                # 1. Grab a larger pool of highly recommended movies for this specific user (e.g., Top 30)
-                pool_size = max(top_n, 30)
+                pool_size = max(top_n * 2, 30)
                 if pool_size > num_items:
                     pool_size = num_items
     
                 top_indices_pool = np.argsort(-scores)[:pool_size]
-
-                # 2. Randomly shuffle and select 'top_n' movies from this elite pool
-                selected_indices = np.random.choice(top_indices_pool, size=top_n, replace=False)
-
-                # 3. Get the movie data for our selected shuffled list
+                selected_indices = np.random.choice(top_indices_pool, size=pool_size, replace=False)
                 selected_rows = df_movies.iloc[selected_indices].to_dict('records')
                 
-                
-                # Format predictions perfectly to feed your existing JavaScript renderMovies() grid
-                for rank, row in enumerate(selected_rows):
+                for row in selected_rows:
                     m_id = int(row['movie_id'])
+                    
+                    # FYP SAFETY: Skip banned movies
+                    if m_id in BANNED_MOVIES:
+                        continue
+                        
                     overview = row.get('overview', '')
                     mood_score = float(row.get('vader_sentiment', 0.0))
                     social_data = SOCIAL_DB.get(str(m_id), {"likes": 0, "dislikes": 0, "comments": []})
                     
-                    # Extract the release year safely if present in your local CSV production file
                     release_year = ""
                     if 'release_date' in row and row['release_date']:
                         release_year = str(row['release_date'])[:4]
@@ -249,7 +282,7 @@ def get_live_recommendations():
                         release_year = str(row['release_year'])
                         
                     recommendations.append({
-                        "rank": rank + 1,
+                        "rank": len(recommendations) + 1,
                         "tmdb_id": m_id,
                         "title": row.get('title', "Unknown Title"),
                         "release_year": release_year,
@@ -262,16 +295,16 @@ def get_live_recommendations():
                         "comments": social_data["comments"],
                         "mood_score": mood_score
                     })
+                    
+                    if len(recommendations) == top_n:
+                        break
                 
                 used_lightfm = True
-                print(f"🧠 [AI ENGINE] Successfully generated {len(recommendations)} personalized matrix matches for User {user_id}")
                 
             except Exception as ml_error:
-                print(f"⚠️ [AI WARNING] LightFM prediction out of bounds or failed: {str(ml_error)}. Routing to backup live array.")
+                print(f"⚠️ [AI WARNING] {str(ml_error)}. Routing to backup.")
         
-        # 3. ROBUST FALLBACK ENGINE: If LightFM is bypassed or errors out, consult live TMDB Trending
         if not used_lightfm:
-            print("🌐 [FALLBACK] Fetching real-time global trending feeds from TMDB API...")
             TMDB_TOKEN = os.getenv("TMDB_ACCESS_TOKEN")
             headers = {"Authorization": f"Bearer {TMDB_TOKEN}", "accept": "application/json"}
             
@@ -280,10 +313,12 @@ def get_live_recommendations():
             
             res = requests.get(url, headers=headers)
             if res.status_code != 200:
-                return jsonify({"success": False, "error": "Failed to pull live feeds from TMDB API fallback"}), 500
+                return jsonify({"success": False, "error": "Failed API"}), 500
                 
             results = res.json().get('results', [])
-            selected_movies = random.sample(results, min(len(results), top_n))
+            
+            safe_results = [m for m in results if not m.get("adult", False) and m.get("id") not in BANNED_MOVIES]
+            selected_movies = random.sample(safe_results, min(len(safe_results), top_n))
             
             genre_res = requests.get("https://api.themoviedb.org/3/genre/movie/list?language=en", headers=headers)
             genre_lookup = {g["id"]: g["name"] for g in genre_res.json().get("genres", [])} if genre_res.status_code == 200 else {}
@@ -321,58 +356,37 @@ def get_live_recommendations():
 
 @app.route('/api/similar', methods=['GET'])
 def get_similar_movies():
-    """Returns movies with the closest emotional tone using NLP VADER scores."""
     try:
         target_id = int(request.args.get('tmdb_id'))
         top_n = int(request.args.get('top_n', 6))
         
-        # 1. Try to get the mood from the map
         target_mood = mood_map.get(target_id) or mood_map.get(str(target_id))
         
-       # 2. SELF-HEALING LOGIC: If missing, calculate it on the fly!
         if target_mood is None:
-            print(f"DEBUG: Mood missing for {target_id}. Calculating on the fly...")
-            
-            # Fetch the plot summary from local database first
             overview = overview_map.get(target_id) or overview_map.get(str(target_id))
-            
-            # --- NEW LIVE FETCH LOGIC ---
-            # If the movie isn't in our local database, ask TMDB for the plot directly!
             if not overview:
                 TMDB_TOKEN = os.getenv("TMDB_ACCESS_TOKEN")
                 url = f"https://api.themoviedb.org/3/movie/{target_id}?language=en-US"
                 headers = {"Authorization": f"Bearer {TMDB_TOKEN}", "accept": "application/json"}
-                
                 res = requests.get(url, headers=headers)
                 if res.status_code == 200:
                     overview = res.json().get("overview", "")
-                    overview_map[target_id] = overview # Save it locally so it's faster next time!
-            # -----------------------------
+                    overview_map[target_id] = overview 
             
             if overview and str(overview).strip() != "":
-                # Run VADER NLP Analysis
                 target_mood = sia.polarity_scores(str(overview))['compound']
-                
-                # Save it into the dictionary so it doesn't have to calculate it again
                 mood_map[target_id] = target_mood
-                print(f"DEBUG: New mood score for {target_id} is {target_mood}")
             else:
-                return jsonify({
-                    "success": False, 
-                    "error": f"Movie ID {target_id} has no plot summary. Cannot calculate Vibe."
-                })
+                return jsonify({"success": False, "error": f"Movie ID {target_id} has no plot summary. Cannot calculate Vibe."})
 
-        # Calculate mathematical distance
         similarity_scores = []
         for m_id, mood in mood_map.items():
-            # Ensure m_id is treated as an int for comparison
-            if int(m_id) == target_id: 
+            if int(m_id) == target_id or int(m_id) in BANNED_MOVIES: 
                 continue 
             
             mood_difference = abs(target_mood - mood)
             similarity_scores.append((m_id, mood_difference, mood))
             
-        # Sort by closest match (smallest difference)
         similarity_scores.sort(key=lambda x: x[1])
         top_matches = similarity_scores[:top_n]
         
@@ -397,25 +411,20 @@ def get_similar_movies():
                 "rating": round(float(rating_map.get(int(m_id), 0.0)), 1)
             })
             
-        # Grab the title so the frontend can display it in the "Because you liked..." header!
         target_title = title_map.get(int(target_id), "this movie")
-        return jsonify({
-            "success": True, 
-            "target_id": target_id, 
-            "target_title": target_title,
-            "recommendations": recommended_movies
-        })
+        return jsonify({"success": True, "target_id": target_id, "target_title": target_title, "recommendations": recommended_movies})
         
     except Exception as e:
-        return jsonify({"success": False, "error": str(e)}) # Also removed the 500 here for UI safety
+        return jsonify({"success": False, "error": str(e)}) 
 
 @app.route('/api/genre/<genre_name>', methods=['GET'])
 def get_movies_by_genre(genre_name):
-    print(f"DEBUG: Searching for genre: {genre_name}") # This will print to your terminal if it's working
     filtered_df = df_movies[df_movies['genres'].str.contains(genre_name, case=False, na=False)]
-    movies = filtered_df.head(10).to_dict('records')
     
-    # Format the data exactly like your recommendation logic so renderMovies() accepts it
+    # Filter out banned movies before picking the top 10
+    safe_movies = filtered_df[~filtered_df['movie_id'].isin(BANNED_MOVIES)]
+    movies = safe_movies.head(10).to_dict('records')
+    
     results = []
     for rank, movie in enumerate(movies):
         m_id = int(movie['movie_id'])
@@ -439,21 +448,14 @@ def get_movies_by_genre(genre_name):
 @app.route('/api/movie-of-the-day', methods=['GET'])
 def get_movie_of_the_day():
     try:
-        # 1. Get today's date as a string (e.g., '2026-07-03')
         today_str = datetime.date.today().isoformat()
-        
-        # 2. Seed the random generator with today's date
         random.seed(today_str)
         
-        # 3. Pick a movie (Ensure we have movies to pick from)
-        movie_ids = list(title_map.keys())
+        movie_ids = [m for m in list(title_map.keys()) if m not in BANNED_MOVIES]
         if not movie_ids:
             return jsonify({"success": False, "error": "No movies in database"}), 404
             
-        # Optional: You can filter for highly rated movies only here
         featured_id = random.choice(movie_ids)
-        
-        # 4. RESET the seed to system time so it doesn't affect other random functions!
         random.seed() 
         
         movie_data = {
@@ -472,11 +474,10 @@ def get_movie_of_the_day():
 
 @app.route('/api/trending-actors', methods=['GET'])
 def get_trending_actors():
-    """Fetches a randomized list of trending actors from TMDB, strictly filtering out adult content."""
     try:
         TMDB_TOKEN = os.getenv("TMDB_ACCESS_TOKEN")
         
-        random_page = random.randint(1, 2)
+        random_page = random.randint(1, 3)
         url = f"https://api.themoviedb.org/3/trending/person/week?language=en-US&page={random_page}"
         headers = {"Authorization": f"Bearer {TMDB_TOKEN}", "accept": "application/json"}
         
@@ -484,12 +485,32 @@ def get_trending_actors():
         if res.status_code == 200:
             actors = res.json().get('results', [])
             
-            # 1. NEW: Added 'not a.get("adult", False)' to completely ban adult actors
-            valid_actors = [
-                {"id": a["id"], "name": a["name"], "profile_path": a["profile_path"]} 
-                for a in actors if a.get("profile_path") and not a.get("adult", False)
-            ]
+            bad_words = ["erotic", "porn", "softcore", "sex ", "lust", "seduce", "sensual", "desire", "vivamax", "nude", "nudity", "steamy", "affair", "scandal"]
+            valid_actors = []
             
+            for a in actors:
+                # FYP SAFETY: Check the Admin Blocklist
+                if a["id"] in BANNED_ACTORS:
+                    continue
+                    
+                if not a.get("profile_path") or a.get("adult", False):
+                    continue
+                    
+                is_safe = True
+                mainstream_score = 0 
+                
+                for work in a.get("known_for", []):
+                    text = str(work.get("overview", "")) + " " + str(work.get("title", "")) + " " + str(work.get("name", ""))
+                    if any(bad in text.lower() for bad in bad_words):
+                        is_safe = False
+                        break 
+                        
+                    if work.get("vote_count", 0) > 150:
+                        mainstream_score += 1
+                        
+                if is_safe and mainstream_score > 0:
+                    valid_actors.append({"id": a["id"], "name": a["name"], "profile_path": a["profile_path"]})
+
             if len(valid_actors) > 12:
                 selected_actors = random.sample(valid_actors, 12)
             else:
@@ -503,7 +524,6 @@ def get_trending_actors():
 
 @app.route('/api/actor/<int:actor_id>/movies', methods=['GET'])
 def get_actor_movies(actor_id):
-    """Fetches a specific actor's top movies, strictly filtering out adult films."""
     try:
         TMDB_TOKEN = os.getenv("TMDB_ACCESS_TOKEN")
         url = f"https://api.themoviedb.org/3/person/{actor_id}/movie_credits?language=en-US"
@@ -512,15 +532,22 @@ def get_actor_movies(actor_id):
         res = requests.get(url, headers=headers)
         if res.status_code == 200:
             movies = res.json().get('cast', [])
+            sorted_movies = sorted(movies, key=lambda x: x.get('popularity', 0), reverse=True)
             
-            sorted_movies = sorted(movies, key=lambda x: x.get('popularity', 0), reverse=True)[:15]
-            
+            bad_words = ["erotic", "porn", "softcore", "sex ", "lust", "seduce", "sensual", "desire", "vivamax", "nude", "nudity", "steamy", "affair", "scandal"]
             recommendations = []
-            for rank, m in enumerate(sorted_movies):
-                
-                # 2. NEW: Added 'not m.get("adult", False)' to ban any adult-rated movies from showing in the grid
-                if m.get("poster_path") and not m.get("adult", False): 
+            
+            for m in sorted_movies:
+                # FYP SAFETY: Check if admin banned this movie
+                if m["id"] in BANNED_MOVIES:
+                    continue
                     
+                if m.get("poster_path") and not m.get("adult", False) and m.get("vote_count", 0) > 50: 
+                    
+                    text = str(m.get("overview", "")) + " " + str(m.get("title", ""))
+                    if any(bad in text.lower() for bad in bad_words):
+                        continue 
+                        
                     full_date = m.get("release_date", "")
                     release_year = full_date[:4] if full_date else "N/A"
                     
@@ -536,7 +563,6 @@ def get_actor_movies(actor_id):
                         "likes": 0, "dislikes": 0, "comments": [], "mood_score": 0
                     })
                     
-                    # Stop once we have 12 clean, safe movies
                     if len(recommendations) == 12:
                         break
                         
@@ -548,7 +574,6 @@ def get_actor_movies(actor_id):
 
 @app.route('/api/profile/<username>', methods=['GET'])
 def get_profile(username):
-    """Fetches user profile details, personal info, and their history of liked movies."""
     user = USER_DATABASE.get(username)
     if not user:
         return jsonify({"success": False, "error": "User not found"}), 404
@@ -559,7 +584,7 @@ def get_profile(username):
         user_likes = df_likes[df_likes["matrix_id"] == user["matrix_id"]]["tmdb_id"].tolist()
         
         for m_id in set(user_likes):
-            if int(m_id) in title_map:
+            if int(m_id) in title_map and int(m_id) not in BANNED_MOVIES:
                 liked_movies.append({
                     "tmdb_id": int(m_id),
                     "title": title_map.get(int(m_id), "Unknown"),
@@ -582,7 +607,6 @@ def get_profile(username):
 
 @app.route('/api/profile/update_details', methods=['POST'])
 def update_profile_details():
-    """Allows users to update their personal details."""
     data = request.json
     username = data.get('username')
     
@@ -597,9 +621,11 @@ def update_profile_details():
 
 @app.route('/api/movie/<int:movie_id>', methods=['GET'])
 def get_movie_details(movie_id):
-    """Fetches full movie details including Director and Actors for the Details Page."""
+    # FYP SAFETY: Block detail requests for banned movies
+    if movie_id in BANNED_MOVIES:
+        return jsonify({"success": False, "error": "Classified Information"}), 404
+        
     try:
-        # 1. Try to find the movie in our local AI database first
         local_movie = df_movies[df_movies['movie_id'] == movie_id]
         
         if not local_movie.empty:
@@ -618,7 +644,6 @@ def get_movie_details(movie_id):
                 "release_year": release_date[:4] if release_date else ""
             }
         else:
-            # 2. LIVE TMDB FALLBACK: If they clicked a brand new trending movie not in our DB
             TMDB_TOKEN = os.getenv("TMDB_ACCESS_TOKEN")
             headers = {"Authorization": f"Bearer {TMDB_TOKEN}", "accept": "application/json"}
             
@@ -628,14 +653,13 @@ def get_movie_details(movie_id):
                 
             m = res.json()
             
-            # Ask TMDB for the specific Cast and Crew list
             cred_res = requests.get(f"https://api.themoviedb.org/3/movie/{movie_id}/credits?language=en-US", headers=headers)
             director, actors = "Unknown", "Unknown"
             
             if cred_res.status_code == 200:
                 c_data = cred_res.json()
                 director = next((c["name"] for c in c_data.get("crew", []) if c["job"] == "Director"), "Unknown")
-                actors_list = [a["name"] for a in c_data.get("cast", [])[:5]] # Get top 5 actors
+                actors_list = [a["name"] for a in c_data.get("cast", [])[:5]] 
                 actors = "|".join(actors_list) if actors_list else "Unknown"
                 
             genre_names = [g['name'] for g in m.get('genres', [])]
@@ -652,7 +676,6 @@ def get_movie_details(movie_id):
                 "release_year": m.get('release_date', '')[:4] if m.get('release_date') else ""
             }
 
-        # 3. Attach their Social interactions (Likes/Dislikes)
         social_data = SOCIAL_DB.get(str(movie_id), {"likes": 0, "dislikes": 0, "comments": []})
         movie_data["social"] = social_data
 
@@ -663,12 +686,11 @@ def get_movie_details(movie_id):
 
 @app.route('/api/onboarding/movies', methods=['GET'])
 def get_onboarding_movies():
-    """Fetches a highly-rated, diverse set of movies for new users to choose from."""
     try:
-        # Grab the top 50 highest rated movies from our local AI database
-        top_movies = df_movies[df_movies['vote_average'] > 7.0]
+        # Filter out banned movies
+        safe_df = df_movies[~df_movies['movie_id'].isin(BANNED_MOVIES)]
+        top_movies = safe_df[safe_df['vote_average'] > 7.0]
         
-        # Randomly sample 18 of them so the grid looks fresh every time
         if not top_movies.empty:
             sample_size = min(18, len(top_movies))
             selected = top_movies.sample(sample_size).to_dict('records')
@@ -687,24 +709,19 @@ def get_onboarding_movies():
 
 @app.route('/api/onboarding/complete', methods=['POST'])
 def complete_onboarding():
-    """Saves the user's initial movie selections straight into the ML pipeline."""
     data = request.json
     username = data.get('username')
-    selected_movies = data.get('selected_movies', []) # Array of TMDB IDs
+    selected_movies = data.get('selected_movies', []) 
     
     if username in USER_DATABASE:
         matrix_id = USER_DATABASE[username]['matrix_id']
-        
-        # 1. Flip their status so they never see the onboarding screen again
         USER_DATABASE[username]['needs_onboarding'] = False
         
-        # 2. Inject their choices into the Matrix CSV file!
         os.makedirs("data", exist_ok=True)
         with open("data/real_likes.csv", "a") as f:
             for m_id in selected_movies:
                 f.write(f"{matrix_id},{m_id},1.0\n")
                 
-                # Instantly add a like to the social database too
                 if str(m_id) not in SOCIAL_DB:
                     SOCIAL_DB[str(m_id)] = {"likes": 1, "dislikes": 0, "comments": []}
                 else:
@@ -716,17 +733,19 @@ def complete_onboarding():
 
 @app.route('/api/top10', methods=['GET'])
 def get_top_10():
-    """Fetches the Top 10 most popular movies in Malaysia right now."""
     try:
         TMDB_TOKEN = os.getenv("TMDB_ACCESS_TOKEN")
         headers = {"Authorization": f"Bearer {TMDB_TOKEN}", "accept": "application/json"}
         
-        # Notice the region=MY parameter! This makes it hyper-localized to Malaysia.
         url = "https://api.themoviedb.org/3/movie/popular?language=en-US&page=1&region=MY"
         
         res = requests.get(url, headers=headers)
         if res.status_code == 200:
-            movies = res.json().get('results', [])[:10] # Slice exactly the first 10
+            raw_movies = res.json().get('results', [])
+            
+            # FYP SAFETY: Remove adult content AND admin banned content BEFORE slicing top 10
+            safe_movies = [m for m in raw_movies if not m.get("adult", False) and m.get("id") not in BANNED_MOVIES]
+            movies = safe_movies[:10] 
             
             results = []
             for rank, m in enumerate(movies):
